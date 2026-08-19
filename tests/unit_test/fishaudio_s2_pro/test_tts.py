@@ -696,7 +696,10 @@ def test_fish_tts_stream_output_builder_gates_and_clears_chunks() -> None:
     assert len(messages) == 1
     assert messages[0].type == "stream"
     assert messages[0].target == "vocoder"
-    assert messages[0].metadata == {"modality": "audio_codes"}
+    assert messages[0].metadata == {
+        "modality": "audio_codes",
+        "stream": True,
+    }
     assert messages[0].data is codes
     assert stream_data.latest_stream_code_chunk is None
     assert stream_output_builder("stream", stream_data, None) == []

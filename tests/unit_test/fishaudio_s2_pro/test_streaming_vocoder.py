@@ -109,7 +109,12 @@ def _code(value: int = 1) -> torch.Tensor:
 
 
 def _chunk(value: int = 1) -> StreamItem:
-    return StreamItem(chunk_id=value, data=_code(value), from_stage="tts_engine")
+    return StreamItem(
+        chunk_id=value,
+        data=_code(value),
+        from_stage="tts_engine",
+        metadata={"modality": "audio_codes", "stream": True},
+    )
 
 
 def _audio_tensor(payload: dict) -> torch.Tensor:
@@ -202,6 +207,44 @@ def test_streaming_vocoder_sample_level_matches_contextual_full_decode() -> None
     streaming_audio = torch.cat(chunks)
     full_audio = codec.from_indices(full_codes[1:][None])[0, 0]
 
+    torch.testing.assert_close(streaming_audio, full_audio)
+
+
+def test_streaming_scheduler_sample_level_matches_contextual_full_decode() -> None:
+    codec = _ContextCodec()
+    scheduler = S2ProVocoderScheduler(
+        codec,
+        device="cpu",
+        stream_stride=3,
+        stream_followup_stride=2,
+        stream_overlap_tokens=1,
+        stream_crossfade_samples=0,
+    )
+    full_codes = torch.arange(11 * 7, dtype=torch.long).reshape(11, 7)
+    payload = _payload("req", code_len=7)
+    scheduler._on_streaming_new_request("req", payload)
+    for idx in range(full_codes.shape[1]):
+        scheduler._on_chunk(
+            "req",
+            StreamItem(
+                chunk_id=idx,
+                data=full_codes[:, idx : idx + 1],
+                from_stage="tts_engine",
+                metadata={"modality": "audio_codes", "stream": True},
+            ),
+        )
+    scheduler._on_done("req")
+
+    messages = []
+    while not scheduler.outbox.empty():
+        messages.append(scheduler.outbox.get_nowait())
+    stream_messages = [message for message in messages if message.type == "stream"]
+    streaming_audio = torch.cat(
+        [_audio_tensor(message.data) for message in stream_messages]
+    )
+    full_audio = codec.from_indices(full_codes[1:][None])[0, 0]
+
+    assert messages[-1].type == "result"
     torch.testing.assert_close(streaming_audio, full_audio)
 
 
@@ -314,6 +357,28 @@ def test_streaming_vocoder_done_before_payload_finalizes_after_new_request() -> 
         _stop_scheduler(scheduler, thread)
 
 
+def test_streaming_vocoder_late_chunk_after_completion_does_not_recreate_state() -> (
+    None
+):
+    scheduler = S2ProVocoderScheduler(
+        _FakeCodec(),
+        device="cpu",
+        stream_stride=1,
+        stream_overlap_tokens=0,
+        stream_crossfade_samples=0,
+    )
+    scheduler._on_streaming_new_request("req", _payload("req"))
+    scheduler._on_chunk("req", _chunk(1))
+    scheduler._on_done("req")
+    while not scheduler.outbox.empty():
+        scheduler.outbox.get_nowait()
+
+    scheduler._on_chunk("req", _chunk(2))
+
+    assert "req" not in scheduler._stream_states
+    assert scheduler.outbox.empty()
+
+
 def test_streaming_vocoder_final_payload_preserves_usage_without_redecode() -> None:
     scheduler, thread = _start_scheduler()
     usage = {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
@@ -422,7 +487,7 @@ def test_streaming_vocoder_abort_cleans_state_and_suppresses_final() -> None:
     )
     thread = threading.Thread(target=scheduler.start, daemon=True)
     try:
-        scheduler._payloads["req"] = _payload("req")
+        scheduler._stream_payloads["req"] = _payload("req")
         scheduler._pending_done.add("req")
         scheduler._on_chunk("req", _chunk(1))
         scheduler._pending_messages.append(IncomingMessage("req", "stream_done"))
@@ -432,7 +497,7 @@ def test_streaming_vocoder_abort_cleans_state_and_suppresses_final() -> None:
         scheduler.abort("req")
         thread.start()
 
-        assert "req" not in scheduler._payloads
+        assert "req" not in scheduler._stream_payloads
         assert "req" not in scheduler._stream_states
         assert "req" not in scheduler._pending_done
         assert "req" in scheduler._aborted_request_ids

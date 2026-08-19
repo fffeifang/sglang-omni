@@ -221,7 +221,7 @@ def make_tts_scheduler_adapters(
                 type="stream",
                 data=codes,
                 target="vocoder",
-                metadata={"modality": "audio_codes"},
+                metadata={"modality": "audio_codes", "stream": True},
             )
         ]
 

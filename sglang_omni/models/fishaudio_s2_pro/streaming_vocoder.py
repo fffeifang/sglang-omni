@@ -10,11 +10,9 @@ from typing import Any
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
-from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
-from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
+from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
 logger = logging.getLogger(__name__)
@@ -28,6 +26,7 @@ class _StreamVocoderState:
     next_vocode_tokens: int = 0
     pending_tail: torch.Tensor | None = None
     total_tokens: int = 0
+    emit_legacy_fallback_payload: bool = False
 
 
 def resolve_stream_overlap_tokens(
@@ -56,21 +55,11 @@ def build_stream_vocoder_chunk(
     stream_overlap_tokens: int,
     stream_crossfade_samples: int,
 ) -> dict[str, Any] | None:
-    assert codes.ndim == 2
-
-    state.codes.append(
-        codes.detach().to(device=device, dtype=torch.long, non_blocking=True)
-    )
-
-    total_tokens = state.total_tokens + int(codes.shape[1])
-    state.total_tokens = total_tokens
-
-    next_vocode_tokens = state.next_vocode_tokens or stream_stride
-    if total_tokens < next_vocode_tokens:
-        state.next_vocode_tokens = next_vocode_tokens
+    _ingest_stream_vocoder_codes(state, codes, device=device)
+    if not _stream_vocoder_decode_due(state, stream_stride=stream_stride):
         return None
 
-    chunk = _build_stream_vocoder_chunk(
+    waveform = _decode_stream_vocoder_waveform(
         state,
         codec=codec,
         device=device,
@@ -78,8 +67,34 @@ def build_stream_vocoder_chunk(
         stream_crossfade_samples=stream_crossfade_samples,
         is_final=False,
     )
-    state.next_vocode_tokens = total_tokens + stream_followup_stride
-    return chunk
+    state.next_vocode_tokens = state.total_tokens + stream_followup_stride
+    if waveform is None:
+        return None
+    return _build_audio_chunk_payload(waveform, sample_rate=codec.sample_rate)
+
+
+def _ingest_stream_vocoder_codes(
+    state: _StreamVocoderState,
+    codes: torch.Tensor,
+    *,
+    device: torch.device,
+) -> None:
+    assert codes.ndim == 2
+
+    state.codes.append(
+        codes.detach().to(device=device, dtype=torch.long, non_blocking=True)
+    )
+    state.total_tokens += int(codes.shape[1])
+
+
+def _stream_vocoder_decode_due(
+    state: _StreamVocoderState, *, stream_stride: int
+) -> bool:
+    next_vocode_tokens = state.next_vocode_tokens or stream_stride
+    if state.total_tokens < next_vocode_tokens:
+        state.next_vocode_tokens = next_vocode_tokens
+        return False
+    return True
 
 
 def flush_stream_vocoder_chunk(
@@ -90,6 +105,26 @@ def flush_stream_vocoder_chunk(
     stream_overlap_tokens: int,
     stream_crossfade_samples: int,
 ) -> dict[str, Any] | None:
+    waveform = _flush_stream_vocoder_waveform(
+        state,
+        codec=codec,
+        device=device,
+        stream_overlap_tokens=stream_overlap_tokens,
+        stream_crossfade_samples=stream_crossfade_samples,
+    )
+    if waveform is None:
+        return None
+    return _build_audio_chunk_payload(waveform, sample_rate=codec.sample_rate)
+
+
+def _flush_stream_vocoder_waveform(
+    state: _StreamVocoderState,
+    *,
+    codec: Any,
+    device: torch.device,
+    stream_overlap_tokens: int,
+    stream_crossfade_samples: int,
+) -> torch.Tensor | None:
     pending_tail = state.pending_tail
     has_codes = bool(state.codes)
     has_pending_tail = pending_tail is not None and pending_tail.numel() > 0
@@ -98,15 +133,12 @@ def flush_stream_vocoder_chunk(
 
     if not has_codes and has_pending_tail:
         state.pending_tail = None
-        return _build_audio_chunk_payload(
-            pending_tail,
-            sample_rate=codec.sample_rate,
-        )
+        return pending_tail
 
     if state.total_tokens <= state.last_vocode_tokens and not has_pending_tail:
         return None
 
-    return _build_stream_vocoder_chunk(
+    return _decode_stream_vocoder_waveform(
         state,
         codec=codec,
         device=device,
@@ -116,7 +148,7 @@ def flush_stream_vocoder_chunk(
     )
 
 
-def _build_stream_vocoder_chunk(
+def _decode_stream_vocoder_waveform(
     state: _StreamVocoderState,
     *,
     codec: Any,
@@ -124,7 +156,7 @@ def _build_stream_vocoder_chunk(
     stream_overlap_tokens: int,
     stream_crossfade_samples: int,
     is_final: bool,
-) -> dict[str, Any] | None:
+) -> torch.Tensor | None:
     if not state.codes:
         return None
 
@@ -138,10 +170,7 @@ def _build_stream_vocoder_chunk(
         if pending_tail is None or pending_tail.numel() == 0:
             return None
         state.pending_tail = None
-        return _build_audio_chunk_payload(
-            pending_tail,
-            sample_rate=codec.sample_rate,
-        )
+        return pending_tail
 
     output_codes = torch.cat(state.codes, dim=1)
     window_start_token = max(code_start_token, emitted_tokens - stream_overlap_tokens)
@@ -181,10 +210,7 @@ def _build_stream_vocoder_chunk(
             keep_from_token=max(0, total_tokens - stream_overlap_tokens),
         )
 
-    return _build_audio_chunk_payload(
-        delta_audio,
-        sample_rate=codec.sample_rate,
-    )
+    return delta_audio
 
 
 def _apply_stream_crossfade(
@@ -274,8 +300,10 @@ def _build_audio_chunk_payload(
     )
 
 
-class S2ProVocoderScheduler(StreamingSimpleScheduler):
-    """Fish S2-Pro vocoder scheduler with streaming and batch final paths."""
+class S2ProVocoderScheduler(StreamingVocoderBase[_StreamVocoderState, None]):
+    """Fish S2-Pro vocoder on the shared, serial streaming lifecycle."""
+
+    _can_batch_stream_chunks = False
 
     def __init__(
         self,
@@ -306,97 +334,100 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             codec, stream_overlap_tokens
         )
         self._stream_crossfade_samples = int(stream_crossfade_samples)
-        self._stream_states: dict[str, _StreamVocoderState] = {}
 
         super().__init__(
             self._vocode_payload,
+            sample_rate=int(codec.sample_rate),
+            stream_source_hint="S2-Pro streaming",
             batch_compute_fn=self._vocode_payloads,
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
         )
-        self._payloads = self._stream_payloads
-
-    def is_streaming_payload(self, payload: StagePayload) -> bool:
-        return self._is_streaming_payload(payload)
 
     def validate_non_streaming_payload(self, payload: StagePayload) -> None:
         self._validate_payload_state(payload)
 
-    def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        del payload
-        self._stream_states.setdefault(request_id, _StreamVocoderState())
+    def create_stream_state(self, request_id: str) -> _StreamVocoderState:
+        del request_id
+        return _StreamVocoderState()
 
-    def on_stream_chunk(
-        self, request_id: str, chunk: StreamItem
-    ) -> list[OutgoingMessage]:
-        state = self._stream_states.setdefault(request_id, _StreamVocoderState())
-        codes = chunk.data
-        if not isinstance(codes, torch.Tensor):
-            raise TypeError(
-                f"S2-Pro stream chunk for {request_id!r} must carry a torch.Tensor, "
-                f"got {type(codes).__name__}"
+    def validate_chunk(
+        self, request_id: str, state: _StreamVocoderState, codes: torch.Tensor
+    ) -> torch.Tensor:
+        del request_id, state
+        assert codes.ndim == 2
+        return codes
+
+    def ingest(
+        self, request_id: str, state: _StreamVocoderState, codes: torch.Tensor
+    ) -> None:
+        del request_id
+        _ingest_stream_vocoder_codes(state, codes, device=self._device)
+
+    def should_decode(self, state: _StreamVocoderState, *, is_final: bool) -> bool:
+        del is_final
+        return _stream_vocoder_decode_due(state, stream_stride=self._stream_stride)
+
+    def decode_delta(
+        self, request_id: str, state: _StreamVocoderState, *, is_final: bool
+    ) -> torch.Tensor | None:
+        del request_id
+        if is_final:
+            return _flush_stream_vocoder_waveform(
+                state,
+                codec=self._codec,
+                device=self._device,
+                stream_overlap_tokens=self._stream_overlap_tokens,
+                stream_crossfade_samples=self._stream_crossfade_samples,
             )
-        output = build_stream_vocoder_chunk(
+
+        waveform = _decode_stream_vocoder_waveform(
             state,
-            codes,
             codec=self._codec,
             device=self._device,
-            stream_stride=self._stream_stride,
-            stream_followup_stride=self._stream_followup_stride,
             stream_overlap_tokens=self._stream_overlap_tokens,
             stream_crossfade_samples=self._stream_crossfade_samples,
+            is_final=False,
         )
-        if output is None:
-            return []
-        return [
-            OutgoingMessage(
-                request_id=request_id,
-                type="stream",
-                data=output,
-                metadata={"modality": "audio"},
-            )
-        ]
+        state.next_vocode_tokens = state.total_tokens + self._stream_followup_stride
+        return waveform
 
-    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
+    def fallback_full_decode(
+        self,
+        request_id: str,
+        payload: StagePayload,
+        state: _StreamVocoderState,
+    ) -> torch.Tensor | None:
+        del request_id
+        result = self._vocode_payload(payload)
+        audio_data = result.data.get("audio_data")
+        if audio_data is None:
+            return None
+        state.emit_legacy_fallback_payload = True
+        return torch.as_tensor(audio_data, dtype=torch.float32)
+
+    def stream_payload(self, request_id: str, waveform: torch.Tensor) -> dict[str, Any]:
         state = self._stream_states.get(request_id)
-        if state is None:
-            return []
-
-        had_streamed_audio = state.last_vocode_tokens > 0
-        output = flush_stream_vocoder_chunk(
-            state,
-            codec=self._codec,
-            device=self._device,
-            stream_overlap_tokens=self._stream_overlap_tokens,
-            stream_crossfade_samples=self._stream_crossfade_samples,
+        if state is not None and state.emit_legacy_fallback_payload:
+            # Preserve S2-Pro's existing one-shot fallback payload; ordinary
+            # streaming chunks continue to use the binary waveform contract.
+            return {
+                "audio_data": waveform.detach().to("cpu", torch.float32).tolist(),
+                "sample_rate": self._codec.sample_rate,
+                "modality": "audio",
+            }
+        return _build_audio_chunk_payload(
+            waveform,
+            sample_rate=self._codec.sample_rate,
         )
-        messages: list[OutgoingMessage] = []
-        if output is not None:
-            messages.append(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="stream",
-                    data=output,
-                    metadata={"modality": "audio"},
-                )
-            )
 
-        payload = self._payloads[request_id]
-        if output is None and not had_streamed_audio:
-            result = self._vocode_payload(payload)
-            messages.append(
-                OutgoingMessage(
-                    request_id=request_id,
-                    type="stream",
-                    data={
-                        key: value
-                        for key, value in result.data.items()
-                        if key in {"audio_data", "sample_rate", "modality"}
-                    },
-                    metadata={"modality": "audio"},
-                )
-            )
-
+    def final_result_data(
+        self,
+        request_id: str,
+        payload: StagePayload,
+        state: _StreamVocoderState,
+    ) -> dict[str, Any]:
+        del request_id, state
         final_state = S2ProState.from_dict(payload.data)
         final_data: dict[str, Any] = {
             "modality": "audio",
@@ -407,21 +438,7 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             final_data["usage"] = usage
         if final_state.finish_reason is not None:
             final_data["finish_reason"] = final_state.finish_reason
-        messages.append(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=final_data,
-                ),
-            )
-        )
-        return messages
-
-    def clear_stream_state(self, request_id: str) -> None:
-        self._stream_states.pop(request_id, None)
+        return final_data
 
     def _vocode_payload(self, payload: StagePayload) -> StagePayload:
         return self._vocode_payloads([payload])[0]
@@ -481,7 +498,3 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             request=payload.request,
             data=data,
         )
-
-    @staticmethod
-    def _is_streaming_payload(payload: StagePayload) -> bool:
-        return bool(payload.request.params.get("stream"))
