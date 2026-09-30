@@ -243,9 +243,15 @@ def apply_stream_crossfade(
                 device=delta_audio.device,
             )
             fade_out = 1.0 - fade_in
-            refreshed = audio_tensor[overlap_samples - crossfade : overlap_samples]
-            blended = pending_tail[-crossfade:] * fade_out + refreshed * fade_in
-            delta_audio = torch.cat([pending_tail[:-crossfade], blended, delta_audio])
+            refreshed_overlap_audio = audio_tensor[
+                overlap_samples - crossfade : overlap_samples
+            ]
+            blended_audio = (
+                pending_tail[-crossfade:] * fade_out + refreshed_overlap_audio * fade_in
+            )
+            delta_audio = torch.cat(
+                [pending_tail[:-crossfade], blended_audio, delta_audio]
+            )
         else:
             delta_audio = torch.cat([pending_tail, delta_audio])
     else:
