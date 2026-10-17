@@ -57,9 +57,16 @@ from sglang_omni.serve.openai_api import ServerStatus, create_app
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     ChatCompletionRequest,
+    CreateSpeechRequest,
 )
 from sglang_omni.serve.realtime.manager import RealtimeDeployment
 from sglang_omni.serve.server_warmup import TranscriptionWarmupRequest
+from sglang_omni.serve.stage_routes import (
+    KEEP_ALIVE_S,
+    StageRoutes,
+    check_route_ownership,
+    export_server_port,
+)
 from sglang_omni.serve.transcriptions import TRANSCRIPTIONS_ENDPOINT
 from sglang_omni.utils.gpu_compat import apply_gpu_compat_env_defaults
 from sglang_omni.utils.gpu_memory import (
@@ -170,6 +177,11 @@ def find_available_port(host: str, port: int) -> int:
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # note (Richard Wang): probe the way the server binds. Uvicorn sets
+            # SO_REUSEADDR, so a port whose last connections are still in
+            # TIME_WAIT after a restart is free for it, while a live listener
+            # still fails this bind.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((host, port))
             return port
     except OSError as exc:
@@ -476,7 +488,9 @@ async def warm_up_server(
     app: FastAPI,
     *,
     base_url: str,
-    requests: list[ChatCompletionRequest | TranscriptionWarmupRequest],
+    requests: list[
+        ChatCompletionRequest | CreateSpeechRequest | TranscriptionWarmupRequest
+    ],
     timeout_s: float,
 ) -> None:
     """Mark the server up once its warmup requests have crossed every stage.
@@ -504,6 +518,11 @@ async def warm_up_server(
                 if isinstance(request, ChatCompletionRequest):
                     post = http_client.post(
                         "/v1/chat/completions",
+                        json=request.model_dump(exclude_none=True),
+                    )
+                elif isinstance(request, CreateSpeechRequest):
+                    post = http_client.post(
+                        "/v1/audio/speech",
                         json=request.model_dump(exclude_none=True),
                     )
                 else:
@@ -564,6 +583,7 @@ async def run_server(
     export_media_policy(allowed_local_media_path, allowed_media_domains)
     # 0. Check port availability before loading models
     port = find_available_port(host, port)
+    export_server_port(port)
 
     mp_runner = MultiProcessPipelineRunner(pipeline_config)
     startup_timeout = float(os.environ.get("SGLANG_OMNI_STARTUP_TIMEOUT", "600"))
@@ -618,6 +638,9 @@ async def run_server(
         app = create_app(
             client,
             model_name=model_name or pipeline_config.name,
+            supports_image_api=pipeline_config.supports_image_api,
+            image_decode_mode=pipeline_config.image_decode_mode(),
+            image_decode_steps=pipeline_config.image_decode_steps(),
             requires_uploaded_voice_for_named_voice=(
                 pipeline_config.requires_uploaded_voice_for_named_voice()
             ),
@@ -637,6 +660,7 @@ async def run_server(
             ),
             additional_speech_languages=pipeline_config.additional_speech_languages,
             max_speech_input_chars=pipeline_config.max_speech_input_chars,
+            supported_speech_fields=pipeline_config.supported_speech_fields,
             enable_realtime=enable_realtime,
             realtime_deployment=realtime_deployment,
             supports_realtime_audio_output=(
@@ -652,6 +676,17 @@ async def run_server(
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
         mount_profiler_routes(app, profiler_ctl, profiler_dir)
+        # Added last, and refused where a stage prefix reaches Omni's own routes.
+        omni_routes = list(app.router.routes)
+        for stage_name, prefixes, socket_path in mp_runner.stage_http_routes:
+            route = StageRoutes(stage_name, prefixes, socket_path)
+            check_route_ownership(omni_routes, route)
+            app.router.routes.append(route)
+            logger.info(
+                "Stage %s serves %s from its own process",
+                stage_name,
+                ", ".join(prefixes),
+            )
         app.state.server_status = ServerStatus.STARTING
 
         config = uvicorn.Config(
@@ -659,7 +694,7 @@ async def run_server(
             host=host,
             port=port,
             log_level=log_level,
-            timeout_keep_alive=120,
+            timeout_keep_alive=KEEP_ALIVE_S,
         )
         server = PipelineUvicornServer(config)
         # note (ratish): a wildcard bind address is not a destination, so the

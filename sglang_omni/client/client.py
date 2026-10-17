@@ -10,6 +10,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, replace
 from typing import AsyncIterator, Callable, TypedDict
 
+import msgspec
 import numpy as np
 
 from sglang_omni.client.audio import (
@@ -27,6 +28,7 @@ from sglang_omni.client.types import (
     CompletionAudio,
     CompletionResult,
     CompletionStreamChunk,
+    DiarizationResult,
     GenerateChunk,
     GenerateRequest,
     SpeechResult,
@@ -35,7 +37,6 @@ from sglang_omni.client.types import (
 from sglang_omni.pipeline.coordinator import Coordinator, CoordinatorHealth
 from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
 from sglang_omni.proto.admin import AdminResponse
-from sglang_omni.proto.request import EXPLICIT_STAGE_SAMPLING_PARAMS_KEY
 from sglang_omni.proto.session import (
     OutputChunk,
     SessionIdentity,
@@ -133,9 +134,19 @@ class Client:
         )
 
     async def append_session(
-        self, session_identity: SessionIdentity, chunk: TimedChunk
+        self,
+        session_identity: SessionIdentity,
+        chunk: TimedChunk,
+        *,
+        ready_timestamp_ns: int | None = None,
+        ready_run_id: str | None = None,
     ) -> int:
-        return await self.coordinator.append_session(session_identity, chunk)
+        return await self.coordinator.append_session(
+            session_identity,
+            chunk,
+            ready_timestamp_ns=ready_timestamp_ns,
+            ready_run_id=ready_run_id,
+        )
 
     def session_outputs(
         self, session_identity: SessionIdentity
@@ -200,6 +211,7 @@ class Client:
         omni_rollout: dict[str, object] | None = None
         weight_version: str | None = None
         language: str | None = None
+        image_base64: str | None = None
 
         async for chunk in self.generate(request, request_id=request_id):
             last_chunk = chunk
@@ -213,6 +225,10 @@ class Client:
                 pass
             if chunk.sample_rate is not None:
                 sample_rate = chunk.sample_rate
+            else:
+                pass
+            if chunk.image is not None:
+                image_base64 = chunk.image
             else:
                 pass
             if chunk.finish_reason is not None:
@@ -282,6 +298,8 @@ class Client:
             omni_rollout=omni_rollout,
             weight_version=weight_version,
             language=language,
+            diarization=last_chunk.diarization,
+            image=image_base64,
         )
 
     # ------------------------------------------------------------------
@@ -656,21 +674,11 @@ class Client:
         inputs = extract_inputs(request)
         params = build_params(request)
         metadata = dict(request.metadata)
-        if (
-            request.stage_sampling
-            and EXPLICIT_STAGE_SAMPLING_PARAMS_KEY not in metadata
-        ):
-            metadata[EXPLICIT_STAGE_SAMPLING_PARAMS_KEY] = {
-                stage: list(sampling)
-                for stage, sampling in params["stage_sampling"].items()
-            }
-        else:
-            pass
         if request.model:
             metadata.setdefault("model", request.model)
         else:
             pass
-        if request.output_modalities:
+        if request.output_modalities is not None:
             metadata["output_modalities"] = request.output_modalities
         else:
             pass
@@ -688,8 +696,9 @@ class Client:
             pass
         if isinstance(result, dict):
             # Multi-terminal merged result, e.g. decode + code2wav/talker/
-            # talker_stream.
+            # talker_stream, or decode + image_decode.
             audio_result = None
+            image_result = None
             if "decode" in result:
                 for audio_stage in ("code2wav", "talker", "talker_stream"):
                     if audio_stage in result:
@@ -697,42 +706,26 @@ class Client:
                         break
                     else:
                         pass
+                if "image_decode" in result:
+                    image_result = result["image_decode"] or {}
+                else:
+                    pass
             else:
                 pass
-            if audio_result is not None:
-                decode_result = result["decode"] or {}
-                text = decode_result.get("text")
-                if isinstance(text, str):
-                    chunk.text = text
+            if audio_result is not None or image_result is not None:
+                chunk = Client.default_result_builder(
+                    request_id, result["decode"] or {}
+                )
+                if audio_result is not None:
+                    Client.set_audio_data(chunk, audio_result)
+                    chunk.usage = chunk.usage or Client.build_usage_info(audio_result)
                 else:
                     pass
-                finish_reason = decode_result.get("finish_reason")
-                if finish_reason is not None:
-                    chunk.finish_reason = finish_reason
-                    chunk.model_finish_reason = decode_result.get(
-                        "model_finish_reason", finish_reason
-                    )
+                if image_result is not None and image_result.get("image") is not None:
+                    chunk.image = image_result["image"]
+                    chunk.modality = "image"
                 else:
                     pass
-                output_token_logprobs = decode_result.get("output_token_logprobs")
-                if output_token_logprobs is not None:
-                    chunk.output_token_logprobs = output_token_logprobs
-                else:
-                    pass
-                omni_rollout = decode_result.get("omni_rollout")
-                if omni_rollout is not None:
-                    chunk.omni_rollout = omni_rollout
-                else:
-                    pass
-                weight_version = decode_result.get("weight_version")
-                if weight_version is not None:
-                    chunk.weight_version = weight_version
-                else:
-                    pass
-                Client.set_audio_data(chunk, audio_result)
-                chunk.usage = Client.build_usage_info(
-                    decode_result
-                ) or Client.build_usage_info(audio_result)
                 return chunk
             else:
                 pass
@@ -791,7 +784,18 @@ class Client:
             else:
                 pass
             Client.set_audio_data(chunk, result)
+            if result.get("image") is not None:
+                chunk.image = result["image"]
+                chunk.modality = "image"
+            else:
+                pass
             chunk.usage = Client.build_usage_info(result)
+            diarization = result.get("diarization")
+            chunk.diarization = (
+                None
+                if diarization is None
+                else msgspec.convert(diarization, type=DiarizationResult)
+            )
             return chunk
         else:
             pass
@@ -989,15 +993,10 @@ def extract_inputs(request: GenerateRequest) -> object:
 
 def build_params(request: GenerateRequest) -> dict[str, object]:
     params = request.sampling.to_dict()
-    max_new_tokens = request.sampling.max_new_tokens
     if request.max_tokens is not None:
-        max_new_tokens = request.max_tokens
+        params["max_new_tokens"] = request.max_tokens
     else:
         pass
-    if max_new_tokens is None:
-        params.pop("max_new_tokens", None)
-    else:
-        params["max_new_tokens"] = max_new_tokens
     params["stream"] = request.stream
     if request.stage_sampling:
         params["stage_sampling"] = {
