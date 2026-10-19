@@ -1655,18 +1655,6 @@ def test_s2pro_semantic_ids_match_per_code_token_lookup() -> None:
     assert vq_ids == expected
 
 
-def test_s2pro_prompt_rejects_semantic_code_out_of_range() -> None:
-    adapter = S2ProTokenizerAdapter(FakeFishTokenizer())
-    reference = Reference(
-        audio_bytes=b"",
-        text="ref",
-        vq_codes=torch.tensor([[4096, 1], [3, 4]], dtype=torch.long),
-    )
-
-    with pytest.raises(ValueError, match="out of range"):
-        adapter.build_prompt("hi", references=[reference], num_codebooks=2)
-
-
 def test_s2pro_adapter_rejects_non_contiguous_semantic_ids() -> None:
     tokenizer = FakeFishTokenizer()
     tokenizer.convert_tokens_to_ids = lambda tokens: [

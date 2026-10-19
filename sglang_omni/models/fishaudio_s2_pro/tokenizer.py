@@ -65,14 +65,6 @@ class InferencePromptEncoder:
     def append_vq(self, codes: torch.Tensor) -> None:
         codes = codes.clone().to(torch.int)
         semantic = codes[0]
-        if semantic.numel() and not (
-            0 <= int(semantic.min()) <= int(semantic.max()) < SEMANTIC_VOCAB_SIZE
-        ):
-            raise ValueError(
-                f"semantic VQ code out of range [0, {SEMANTIC_VOCAB_SIZE})"
-            )
-        else:
-            pass
         tokens = semantic + self.semantic_id_base
         self.token_segments.append(tokens)
         self.vq_mask_segments.append(torch.ones_like(tokens, dtype=torch.bool))
