@@ -41,18 +41,11 @@ class S2ProPrompt(TypedDict):
     vq_parts: list[torch.Tensor]
 
 
-SEMANTIC_VOCAB_SIZE = 4096
-
-
 class InferencePromptEncoder:
     """Accumulate the tensor fields consumed by the Fish serving path."""
 
-    def __init__(
-        self, tokenizer: PreTrainedTokenizerFast, semantic_id_base: int
-    ) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerFast) -> None:
         self.tokenizer = tokenizer
-        # <|semantic:i|> == semantic_id_base + i (contiguity checked by the adapter).
-        self.semantic_id_base = semantic_id_base
         self.token_segments: list[torch.Tensor] = []
         self.vq_mask_segments: list[torch.Tensor] = []
         self.vq_parts: list[torch.Tensor] = []
@@ -64,8 +57,10 @@ class InferencePromptEncoder:
 
     def append_vq(self, codes: torch.Tensor) -> None:
         codes = codes.clone().to(torch.int)
-        semantic = codes[0]
-        tokens = semantic + self.semantic_id_base
+        # Semantic ids are contiguous, as the engine's semantic logit bias assumes.
+        tokens = codes[0] + self.tokenizer.convert_tokens_to_ids(
+            SEMANTIC_TOKEN_TEMPLATE.format(i=0)
+        )
         self.token_segments.append(tokens)
         self.vq_mask_segments.append(torch.ones_like(tokens, dtype=torch.bool))
         self.vq_parts.append(codes)
@@ -83,14 +78,6 @@ class S2ProTokenizerAdapter:
 
     def __init__(self, hf_tokenizer: PreTrainedTokenizerFast) -> None:
         self.tok = hf_tokenizer
-        ids = hf_tokenizer.convert_tokens_to_ids(
-            [SEMANTIC_TOKEN_TEMPLATE.format(i=i) for i in range(SEMANTIC_VOCAB_SIZE)]
-        )
-        if ids != list(range(ids[0], ids[0] + SEMANTIC_VOCAB_SIZE)):
-            raise ValueError("S2-Pro semantic token ids must be contiguous")
-        else:
-            pass
-        self.semantic_id_base = ids[0]
 
     @property
     def eos_token_ids(self) -> list[int]:
@@ -98,11 +85,11 @@ class S2ProTokenizerAdapter:
 
     @property
     def semantic_begin_id(self) -> int:
-        return self.semantic_id_base
+        return self.tok.convert_tokens_to_ids(SEMANTIC_TOKEN_TEMPLATE.format(i=0))
 
     @property
     def semantic_end_id(self) -> int:
-        return self.semantic_id_base + SEMANTIC_VOCAB_SIZE - 1
+        return self.tok.convert_tokens_to_ids(SEMANTIC_TOKEN_TEMPLATE.format(i=4095))
 
     def build_prompt(
         self,
@@ -132,7 +119,7 @@ class S2ProTokenizerAdapter:
         else:
             pass
 
-        encoder = InferencePromptEncoder(self.tok, self.semantic_id_base)
+        encoder = InferencePromptEncoder(self.tok)
 
         # System message: reference audio for voice cloning
         if references:
